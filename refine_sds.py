@@ -68,12 +68,30 @@ import os
 
 from pytorch_lightning import seed_everything   
 
-def encode_1(ip2p, input):
-    latents = ip2p.vae.encode(2*input-1).latent_dist.sample() * 0.18215  # (b*f, 4, h//4, w//4)
+def encode_1(ip2p, input, encode_batch_size=1):
+    """Encode images to latents with batch processing to reduce memory usage."""
+    latents_list = []
+    for i in range(0, input.shape[0], encode_batch_size):
+        batch = input[i:i+encode_batch_size]
+        # Removed autocast to save memory
+        latent = ip2p.vae.encode(2*batch-1).latent_dist.sample() * 0.18215
+        latents_list.append(latent.cpu())  # Move to CPU immediately
+        del batch, latent
+        torch.cuda.empty_cache()
+    latents = torch.cat(latents_list, dim=0).to(device=input.device)  # Move back to GPU
     return latents
 
-def encode_2(ip2p, input):
-    image_latents = ip2p.vae.encode(2*input-1).latent_dist.mode() # (b*f, 4, h//4, w//4)
+def encode_2(ip2p, input, encode_batch_size=1):
+    """Encode images to latents with batch processing to reduce memory usage."""
+    latents_list = []
+    for i in range(0, input.shape[0], encode_batch_size):
+        batch = input[i:i+encode_batch_size]
+        # Removed autocast to save memory
+        latent = ip2p.vae.encode(2*batch-1).latent_dist.mode()
+        latents_list.append(latent.cpu())  # Move to CPU immediately
+        del batch, latent
+        torch.cuda.empty_cache()
+    image_latents = torch.cat(latents_list, dim=0).to(device=input.device)  # Move back to GPU
     return image_latents
     
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
@@ -83,7 +101,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     torch_dtype = torch.float16
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    sequence_length = 4
+    # Reduced to 1 for minimum GPU memory usage
+    sequence_length = 1
 
     diffusion_step = 20
     num_train_timesteps = 1000
@@ -123,10 +142,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         viewpoint_stack = scene.getTrainCameras()
         if opt.custom_sampler is not None:
             sampler = FineSampler(viewpoint_stack)
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=4,collate_fn=list)
             random_loader = False
         else:
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=4,collate_fn=list)
             random_loader = True
         loader = iter(viewpoint_stack_loader)
     
@@ -184,20 +203,23 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         if opt.dataloader and not load_in_memory:
             try:
                 viewpoint_cams=[]
-                viewpoint_cams1 = next(loader)
-                viewpoint_cams2 = next(loader) #
+                # Dynamically load batches based on sequence_length
+                while len(viewpoint_cams) < sequence_length:
+                    batch_cams = next(loader)
+                    viewpoint_cams.extend(batch_cams)
                 
-                viewpoint_cams.extend(viewpoint_cams1)
-                viewpoint_cams.extend(viewpoint_cams2) #
-
+                # Trim to exact sequence_length if we got more cameras than needed
+                viewpoint_cams = viewpoint_cams[:sequence_length]
+                
                 #print(len(viewpoint_cams))
                 assert len(viewpoint_cams)==sequence_length, "Cams length is not equal to seg_length"
             except StopIteration:
                 print("reset dataloader into random dataloader.")
                 if not random_loader:
-                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=32,collate_fn=list)
+                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=4,collate_fn=list)
                     random_loader = True
                 loader = iter(viewpoint_stack_loader)
+                torch.cuda.empty_cache()  # Clear memory when resetting loader
                 continue
 
         else:
@@ -242,9 +264,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
         
+        # Clear intermediate lists to free memory
+        del images, gt_images, radii_list, visibility_filter_list
+        torch.cuda.empty_cache()
+        
         dataset_length, C, H, W = image_tensor.shape
         
-        args.resize = 1024
+        # Reduced from 256 to 128 to save even more GPU memory
+        args.resize = 128
         factor = args.resize / max(W, H)
         factor = math.ceil(min(W, H) * factor / 64) * 64 / min(W, H)
         new_width = int((W * factor) // 64) * 64
@@ -258,6 +285,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         
         latents = encode_1(ip2p, vae_input_images)
         image_latents = encode_2(ip2p, vae_input_images_cond)
+        
+        # Clear VAE input tensors to free memory
+        del vae_input_images, vae_input_images_cond
+        torch.cuda.empty_cache()
 
         #print(latents.shape) # fx4x96x128
         
@@ -323,6 +354,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # norm
         
         loss = loss_sds
+        
+        # Clear intermediate tensors to save memory
+        del latents, image_latents, uncond_image_latents, prompt_embeds, noise, grad, target
+        torch.cuda.empty_cache()
+        
         #if stage == "fine" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
         #     tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
@@ -353,6 +389,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                                           "psnr": f"{psnr_:.{2}f}",
                                           "point":f"{total_point}"})
                 progress_bar.update(10)
+                # Aggressive memory clearing every 10 iterations
+                torch.cuda.empty_cache()
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -382,17 +420,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                  
                 opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
                 densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
-                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000:
+                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<30000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
-                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
+                    torch.cuda.empty_cache()  # Clear memory after densification
+                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>10000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    torch.cuda.empty_cache()  # Clear memory after pruning
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<30000 and opt.add_point:
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
                     # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
