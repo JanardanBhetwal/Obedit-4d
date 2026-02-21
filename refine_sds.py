@@ -8,6 +8,9 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import sys
+sys.stdout.isatty = lambda: False
+
 import numpy as np
 import random
 import os, sys
@@ -414,7 +417,29 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     gaussians.load_ply(args.ply_path)
     print(f"Loaded ply from ${args.ply_path}")
     
-    gaussians.load_model(os.path.join(args.model_path,"point_cloud","iteration_" + str(14000)))
+    # gaussians.load_model(os.path.join(args.model_path,"point_cloud","iteration_" + str(14000)))
+    # Automatically load the latest iteration available
+    point_cloud_dir = os.path.join(args.model_path, "point_cloud")
+
+    # find all iteration folders
+    iterations = []
+    if os.path.exists(point_cloud_dir):
+        for name in os.listdir(point_cloud_dir):
+            if name.startswith("iteration_"):
+                try:
+                    iterations.append(int(name.split("_")[1]))
+                except ValueError:
+                    pass  # ignore invalid folder names
+    else:
+        raise FileNotFoundError(f"Point cloud folder not found: {point_cloud_dir}")
+
+    if not iterations:
+        raise FileNotFoundError(f"No iteration folders found in {point_cloud_dir}")
+
+    latest_iter = max(iterations)
+    print(f"Loading latest checkpoint: iteration_{latest_iter}")
+    gaussians.load_model(os.path.join(point_cloud_dir, f"iteration_{latest_iter}"))
+
     gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]),device="cuda"),0)
     print("Loaded deformation field")
     timer.start()
@@ -427,6 +452,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     DDIM_SOURCE = "CompVis/stable-diffusion-v1-4"
     IP2P_SOURCE = "timbrooks/instruct-pix2pix"
     tokenizer = CLIPTokenizer.from_pretrained(IP2P_SOURCE, subfolder="tokenizer")
+    sys.stdout.isatty = lambda: False
     text_encoder = CLIPTextModel.from_pretrained(IP2P_SOURCE, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(IP2P_SOURCE, subfolder="vae")
     unet = UNet3DConditionModel.from_pretrained_2d(IP2P_SOURCE, subfolder="unet")

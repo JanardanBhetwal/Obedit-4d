@@ -7,3 +7,6 @@ tensorboard_3d
 screenshots
 colmap/
 .ipynb_checkpoints/
+data/
+output/
+**/data/

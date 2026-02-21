@@ -35,14 +35,17 @@ from .ip2p_blocks import (
     get_up_block,
 )
 from .ip2p_resnet import InflatedConv3d
-from diffusers.utils import (
-    DIFFUSERS_CACHE,
-    HF_HUB_OFFLINE,
-    SAFETENSORS_WEIGHTS_NAME,
-    _add_variant,
-    _get_model_file,
-    logging,
-)
+# from diffusers.utils.hub_utils import DIFFUSERS_CACHE, HF_HUB_OFFLINE, _get_model_file
+from huggingface_hub.constants import HF_HUB_CACHE as DIFFUSERS_CACHE
+from diffusers.utils.hub_utils import HF_HUB_OFFLINE, _get_model_file
+# from diffusers.utils.import_utils import _add_variant
+from diffusers.utils import SAFETENSORS_WEIGHTS_NAME
+# from diffusers.utils import logging
+
+def _add_variant(cls):
+    return cls
+
+
 
 from diffusers.models.modeling_utils import load_state_dict
 
@@ -501,7 +504,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
     @classmethod
     def from_pretrained_2d(
         cls, 
-        pretrained_model_path: Optional[Union[str, os.PathLike]],
+        pretrained_model_path: Optional[Union[str, os.PathLike]] = "CompVis/stable-diffusion-v1-4",  # Default to CompVis stable-diffusion-v1-4
+        weights_name: Optional[str] = "diffusion_pytorch_model.safetensors",  # Updated weights file name
+        subfolder: Optional[str] = "unet",  # Specify the subfolder where the file is located
         **kwargs
     ):
         cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
@@ -509,12 +514,10 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         local_files_only = kwargs.pop("local_files_only", HF_HUB_OFFLINE)
         use_auth_token = kwargs.pop("use_auth_token", None)
         revision = kwargs.pop("revision", None)
-        subfolder = kwargs.pop("subfolder", None)
-        variant = kwargs.pop("variant", None)
         
         config = cls.load_config(
             pretrained_model_name_or_path=pretrained_model_path,
-            subfolder=subfolder,
+            subfolder=subfolder,  # Use the subfolder argument
             return_unused_kwargs=False,
             return_commit_hash=False,
             resume_download=force_download,
@@ -545,23 +548,30 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             "framework": "pytorch",
         }
         
-        model_file = _get_model_file(
-            pretrained_model_path,
-            weights_name=_add_variant(SAFETENSORS_WEIGHTS_NAME, variant),
-            cache_dir=cache_dir,
-            force_download=force_download,
-            resume_download=force_download,
-            proxies=force_download,
-            local_files_only=local_files_only,
-            use_auth_token=use_auth_token,
-            revision=revision,
-            subfolder=subfolder,
-            user_agent=user_agent,
-        )
-        
+        proxies = kwargs.pop("proxies", None)  # Added default value for proxies
+
+        try:
+            model_file = _get_model_file(
+                pretrained_model_path,
+                weights_name=weights_name,  # Use the updated weights_name argument
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=force_download,
+                proxies=proxies,  # Use the proxies argument
+                local_files_only=local_files_only,
+                revision=revision,
+                subfolder=subfolder,  # Use the subfolder argument
+            )
+        except Exception as e:
+            raise EnvironmentError(
+                f"Error while trying to load the model file from {pretrained_model_path}.\n"
+                f"Details: {str(e)}\n"
+                f"Please ensure the file '{weights_name}' exists in the repository or specify the correct file name."
+            )
+
         model = cls.from_config(config)
         
-        state_dict = load_state_dict(model_file, variant=variant)
+        state_dict = load_state_dict(model_file)
         
         # state_dict = torch.load(model_file, map_location="cpu")
         for k, v in model.state_dict().items():

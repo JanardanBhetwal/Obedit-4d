@@ -17,10 +17,9 @@ from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
     logging,
-    randn_tensor,
     BaseOutput,
 )
-
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 
 from diffusers.pipelines import DiffusionPipeline
