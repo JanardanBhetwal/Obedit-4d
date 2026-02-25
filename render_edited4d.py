@@ -135,7 +135,28 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     gaussians.load_ply(args.ply_path)
-    gaussians.load_model(os.path.join(args.model_path, 'point_cloud', 'iteration_14000')) ##########
+    
+    # Automatically find and load the latest iteration available
+    point_cloud_dir = os.path.join(args.model_path, "point_cloud")
+    
+    # Find all iteration folders
+    iterations = []
+    if os.path.exists(point_cloud_dir):
+        for name in os.listdir(point_cloud_dir):
+            if name.startswith("iteration_"):
+                try:
+                    iterations.append(int(name.split("_")[1]))
+                except ValueError:
+                    pass  # ignore invalid folder names
+    else:
+        raise FileNotFoundError(f"Point cloud folder not found: {point_cloud_dir}")
+    
+    if not iterations:
+        raise FileNotFoundError(f"No iteration folders found in {point_cloud_dir}")
+    
+    latest_iter = max(iterations)
+    print(f"Loading latest checkpoint: iteration_{latest_iter}")
+    gaussians.load_model(os.path.join(point_cloud_dir, f"iteration_{latest_iter}"))
     
     after_xyz = gaussians.get_xyz
     print("after edit: ", gaussians.get_xyz.shape)
@@ -151,8 +172,3 @@ if __name__ == "__main__":
     ## TODO: save_path
     imageio.mimwrite(os.path.join(args.model_path, f"edited_{os.path.splitext(os.path.basename(args.configs))[0]}.mp4"), imgs, fps=30)
     print("Video Saved.")
-        
-
-    
-
-    
