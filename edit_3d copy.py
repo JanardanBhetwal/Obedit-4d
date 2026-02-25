@@ -383,7 +383,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     scene = Scene(dataset, gaussians, load_coarse=None)
     
     gaussians.load_ply(args.ply_path)
-    gaussians.load_model(os.path.join(args.model_path,"point_cloud","iteration_" + str(14000)))
+    # Dynamically resolve iteration from ply_path (e.g. .../iteration_14000/point_cloud.ply)
+    _ply_iter_dir = os.path.dirname(args.ply_path)  # .../iteration_XXXXX
+    print(f"loading model from exists{_ply_iter_dir}")
+    gaussians.load_model(_ply_iter_dir)
     gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]),device="cuda"),0)
     
     timer.start()
