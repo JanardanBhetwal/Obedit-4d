@@ -110,6 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_video", action="store_true")
     parser.add_argument("--configs", type=str)
     parser.add_argument("--ply_path", type=str)
+    parser.add_argument("--prompt", type=str, default=None, help="Edit prompt (used for output filename)")
     args = get_combined_args(parser)
     print("Rendering " , args.ply_path)
     if args.configs:
@@ -169,6 +170,23 @@ if __name__ == "__main__":
         rendered_img = render_edited(gaussians, viewpoint_camera)
         imgs.append(to8b(rendered_img.detach().cpu()).transpose(1,2,0))
 
-    ## TODO: save_path
-    imageio.mimwrite(os.path.join(args.model_path, f"edited_{os.path.splitext(os.path.basename(args.configs))[0]}.mp4"), imgs, fps=30)
-    print("Video Saved.")
+    ## Determine a prompt-based filename so different prompts don't overwrite each other
+    import re
+    prompt_tag = getattr(args, "prompt", None)
+    if not prompt_tag:
+        # Try to extract prompt from ply_path  (e.g. .../point_cloud_3dedit/<prompt>/iteration_X/...)
+        ply_parts = os.path.normpath(args.ply_path).split(os.sep)
+        for i, part in enumerate(ply_parts):
+            if part in ("point_cloud_3dedit", "point_cloud_refine") and i + 1 < len(ply_parts):
+                prompt_tag = ply_parts[i + 1]
+                break
+    if prompt_tag:
+        # Sanitize: replace non-alphanumeric characters (except spaces) with nothing, spaces with underscores
+        safe_prompt = re.sub(r'[^\w\s-]', '', prompt_tag).strip()
+        safe_prompt = re.sub(r'[\s]+', '_', safe_prompt)
+    else:
+        safe_prompt = "unknown_prompt"
+    scene_name = os.path.splitext(os.path.basename(args.configs))[0]
+    video_path = os.path.join(args.model_path, f"edited_{scene_name}_{safe_prompt}.mp4")
+    imageio.mimwrite(video_path, imgs, fps=30)
+    print(f"Video Saved: {video_path}")

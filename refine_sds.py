@@ -455,30 +455,31 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
     gaussians.load_ply(args.ply_path)
-    print(f"Loaded ply from ${args.ply_path}")
+    print(f"Loaded ply from {args.ply_path}")
     
-    # gaussians.load_model(os.path.join(args.model_path,"point_cloud","iteration_" + str(14000)))
-    # Automatically load the latest iteration available
-    point_cloud_dir = os.path.join(args.model_path, "point_cloud")
-
-    # find all iteration folders
-    iterations = []
-    if os.path.exists(point_cloud_dir):
-        for name in os.listdir(point_cloud_dir):
-            if name.startswith("iteration_"):
-                try:
-                    iterations.append(int(name.split("_")[1]))
-                except ValueError:
-                    pass  # ignore invalid folder names
+    # Load deformation from the same directory as the ply file.
+    # This ensures point counts match (e.g. after densification in the 3D edit step).
+    _ply_iter_dir = os.path.dirname(args.ply_path)  # .../iteration_XXXXX
+    if os.path.exists(os.path.join(_ply_iter_dir, "deformation.pth")):
+        print(f"Loading deformation from ply directory: {_ply_iter_dir}")
+        gaussians.load_model(_ply_iter_dir)
     else:
-        raise FileNotFoundError(f"Point cloud folder not found: {point_cloud_dir}")
-
-    if not iterations:
-        raise FileNotFoundError(f"No iteration folders found in {point_cloud_dir}")
-
-    latest_iter = max(iterations)
-    print(f"Loading latest checkpoint: iteration_{latest_iter}")
-    gaussians.load_model(os.path.join(point_cloud_dir, f"iteration_{latest_iter}"))
+        # Fallback: load from the original training checkpoint (highest iteration)
+        print(f"No deformation.pth in {_ply_iter_dir}, falling back to original training checkpoint")
+        point_cloud_dir = os.path.join(args.model_path, "point_cloud")
+        iterations = []
+        if os.path.exists(point_cloud_dir):
+            for name in os.listdir(point_cloud_dir):
+                if name.startswith("iteration_"):
+                    try:
+                        iterations.append(int(name.split("_")[1]))
+                    except ValueError:
+                        pass
+        if not iterations:
+            raise FileNotFoundError(f"No iteration folders found in {point_cloud_dir}")
+        latest_iter = max(iterations)
+        print(f"Loading deformation from: {point_cloud_dir}/iteration_{latest_iter}")
+        gaussians.load_model(os.path.join(point_cloud_dir, f"iteration_{latest_iter}"))
 
     gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]),device="cuda"),0)
     print("Loaded deformation field")
