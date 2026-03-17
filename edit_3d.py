@@ -245,7 +245,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             '''
             if scene.dataset_type!="PanopticSports":
                 # TODO : path 
-                #image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{dict_sear_steak[int(viewpoint_cam.image_name)]}.png))
+                #image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{dict_sear_steak[int(viewpoint_cam.image_name)]}.png"))
                 if scene_name not in ['sear_steak', 'coffee_martini', 'cook_spinach'] and scene.maxtime < 6000:
                     raise NotImplementedError("sorry, please check the camera settings manually and set the dict_(scene_name)")
                 if scene_name == 'sear_steak':
@@ -265,6 +265,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             image_pil = Image.fromarray(image_numpy)
             image_pil.save("gt_{:d}.png".format(dict_sear_steak[int(viewpoint_cam.image_name)]))
             '''
+            # Ensure gt_image has only 3 channels (RGB)
+            gt_image = gt_image[:3, :, :]
             gt_images.append(gt_image.unsqueeze(0))
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
@@ -282,7 +284,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         )
         
         Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-        psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
+        psnr_ = psnr(image_tensor, gt_image_tensor[:,:3,:,:]).mean().double()
         # norm
         loss = Ll1
 
@@ -291,7 +293,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
             loss += tv_loss
         if opt.lambda_dssim != 0:
-            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            ssim_loss = ssim(image_tensor,gt_image_tensor[:,:3,:,:])
             loss += opt.lambda_dssim * (1.0-ssim_loss)
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
