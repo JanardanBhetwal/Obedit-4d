@@ -1,0 +1,18 @@
+# Additional dependencies for evaluate_4dgs.py
+# Add these to your main requirements.txt or install separately
+
+# Metrics and image processing
+torch>=2.0.0
+torchvision>=0.15.0
+torchmetrics>=0.11.0
+lpips>=0.1.4
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# CLIP for semantic similarity
+transformers>=4.30.0
+scipy>=1.9.0  # Required by lpips
+
+# Already in main requirements.txt but listing for completeness:
+# transformers==4.31.0
+# huggingface-hub==0.19.4
