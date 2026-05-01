@@ -68,6 +68,9 @@ import os
 
 from pytorch_lightning import seed_everything   
 
+def encode_fast(ip2p, x):
+    return ip2p.vae.encode(2 * x - 1).latent_dist.sample() * 0.18215
+
 def encode_1(ip2p, input, encode_batch_size=1):
     """Encode images to latents with batch processing to reduce memory usage."""
     latents_list = []
@@ -278,8 +281,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_batch = torch.cat(visibility_filter_list).any(dim=0)
         
         # 3. VAE ENCODE (Batched)
-        latents = encode_1(ip2p, image_tensor)
-        image_latents = encode_2(ip2p, gt_image_tensor)
+        latents = encode_fast(ip2p, image_tensor)
+        image_latents = encode_fast(ip2p, gt_image_tensor)
         
         # Reshape for 3D UNet: b=1, c=4, f=sequence_length
         latents = rearrange(latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)
