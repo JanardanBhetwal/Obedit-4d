@@ -25,7 +25,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, ModelHiddenParams, OptimizationParams #EditOptimizationParams
+from arguments import ModelParams, PipelineParams, ModelHiddenParams, OptimizationParams
 from torch.utils.data import DataLoader
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
@@ -73,7 +73,6 @@ def encode_1(ip2p, input, encode_batch_size=1):
     latents_list = []
     for i in range(0, input.shape[0], encode_batch_size):
         batch = input[i:i+encode_batch_size]
-        # Removed autocast to save memory
         latent = ip2p.vae.encode(2*batch-1).latent_dist.sample() * 0.18215
         latents_list.append(latent.cpu())  # Move to CPU immediately
         del batch, latent
@@ -86,7 +85,6 @@ def encode_2(ip2p, input, encode_batch_size=1):
     latents_list = []
     for i in range(0, input.shape[0], encode_batch_size):
         batch = input[i:i+encode_batch_size]
-        # Removed autocast to save memory
         latent = ip2p.vae.encode(2*batch-1).latent_dist.mode()
         latents_list.append(latent.cpu())  # Move to CPU immediately
         del batch, latent
@@ -96,20 +94,22 @@ def encode_2(ip2p, input, encode_batch_size=1):
     
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer, ip2p, prompt, guidance_scale, image_guidance_scale):
+                         gaussians, scene, stage, tb_writer, train_iter, timer, ip2p, prompt, guidance_scale, image_guidance_scale):
     
     torch_dtype = torch.float16
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Reduced to 1 for minimum GPU memory usage
-    sequence_length = 1
+    # --- PATCH-BASED SDS SETTINGS ---
+    # sequence_length: number of gradient accumulation steps (effective batch size)
+    sequence_length = 4   # Accumulate gradients over 4 views before stepping
+    patch_size = 256      # High-res random crop; avoids downscaling the whole image
 
     diffusion_step = 20
     num_train_timesteps = 1000
     ###
     
     first_iter = 0
-    gaussians.training_only3dgs_setup(opt) #edit optimization params
+    gaussians.training_only3dgs_setup(opt)
 
     for param_group in gaussians.optimizer.param_groups:
         if param_group["name"] == "xyz":
@@ -118,8 +118,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -129,41 +129,46 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
-    # lpips_model = lpips.LPIPS(net="alex").cuda()
+
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
 
-
     if not viewpoint_stack and not opt.dataloader:
-        # dnerf's branch
         viewpoint_stack = [i for i in train_cams]
         temp_list = copy.deepcopy(viewpoint_stack)
-    # 
+
     batch_size = opt.batch_size
     print("data loading done")
     if opt.dataloader:
         viewpoint_stack = scene.getTrainCameras()
         if opt.custom_sampler is not None:
             sampler = FineSampler(viewpoint_stack)
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=1,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size, sampler=sampler, num_workers=1, collate_fn=list)
             random_loader = False
         else:
-            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=1,collate_fn=list)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size, shuffle=True, num_workers=1, collate_fn=list)
             random_loader = True
         loader = iter(viewpoint_stack_loader)
     
-    
-    # dynerf, zerostamp_init
-    # breakpoint()
     if stage == "coarse" and opt.zerostamp_init:
         load_in_memory = True
-        # batch_size = 4
-        temp_list = get_stamp_list(viewpoint_stack,0)
+        temp_list = get_stamp_list(viewpoint_stack, 0)
         viewpoint_stack = temp_list.copy()
     else:
-        load_in_memory = False 
-                            # 
+        load_in_memory = False
+
+    # Pre-encode the prompt once — reused every iteration
+    prompt_embeds = ip2p._encode_prompt(
+        prompt,
+        device=device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=True,
+    )  # [3, 77, 768]
+
+    ip2p.scheduler.config.num_train_timesteps = num_train_timesteps
+    ip2p.scheduler.set_timesteps(diffusion_step)
+
     count = 0
     for iteration in range(first_iter, final_iter+1):        
         if network_gui.conn == None:
@@ -173,21 +178,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    count +=1
-                    viewpoint_index = (count ) % len(video_cams)
-                    if (count //(len(video_cams))) % 2 == 0:
+                    count += 1
+                    viewpoint_index = (count) % len(video_cams)
+                    if (count // (len(video_cams))) % 2 == 0:
                         viewpoint_index = viewpoint_index
                     else:
                         viewpoint_index = len(video_cams) - viewpoint_index - 1
-                    # print(viewpoint_index)
                     viewpoint = video_cams[viewpoint_index]
                     custom_cam.time = viewpoint.time
-                    # print(custom_cam.time, viewpoint_index, count)
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
-
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                     break
             except Exception as e:
                 print(e)
@@ -197,262 +199,227 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-
-        # dynerf's branch
-        if opt.dataloader and not load_in_memory:
-            try:
-                viewpoint_cams=[]
-                # Dynamically load batches based on sequence_length
-                while len(viewpoint_cams) < sequence_length:
-                    batch_cams = next(loader)
-                    viewpoint_cams.extend(batch_cams)
-                
-                # Trim to exact sequence_length if we got more cameras than needed
-                viewpoint_cams = viewpoint_cams[:sequence_length]
-                
-                #print(len(viewpoint_cams))
-                assert len(viewpoint_cams)==sequence_length, "Cams length is not equal to seg_length"
-            except StopIteration:
-                print("reset dataloader into random dataloader.")
-                if not random_loader:
-                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=1,collate_fn=list)
-                    random_loader = True
-                loader = iter(viewpoint_stack_loader)
-                torch.cuda.empty_cache()  # Clear memory when resetting loader
-                continue
-
-        else:
-            idx = 0
-            viewpoint_cams = []
-            
-            while idx < sequence_length: ##    
-                viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
-                if not viewpoint_stack :
-                    viewpoint_stack =  temp_list.copy()
-                viewpoint_cams.append(viewpoint_cam)
-                idx +=1
-            if len(viewpoint_cams) == 0:
-                continue
-        # print("length of viewpoint_cams: ", len(viewpoint_cams)) 
-        # breakpoint()   
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        images = []
-        gt_images = []
-        radii_list = []
-        visibility_filter_list = []
-        viewspace_point_tensor_list = []
 
-        for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            images.append(image.unsqueeze(0))
-            if scene.dataset_type!="PanopticSports":
+        # -----------------------------------------------------------------------
+        # PATCH-BASED SDS + GRADIENT ACCUMULATION
+        # -----------------------------------------------------------------------
+        # Zero gradients ONCE before the accumulation loop
+        gaussians.optimizer.zero_grad(set_to_none=True)
+
+        loss_log = 0.0
+        psnr_log = 0.0
+        viewspace_point_tensor_grad = None
+
+        # Keep track of last-seen visibility info for densification
+        last_visibility_filter = None
+        last_radii = None
+        last_viewspace_point_tensor = None
+
+        for seq_idx in range(sequence_length):
+
+            # ---- Pick ONE camera ----
+            if opt.dataloader and not load_in_memory:
+                # Dataloader branch: pull a single camera from the loader
+                try:
+                    viewpoint_cam = next(loader)[0]
+                except StopIteration:
+                    print("reset dataloader into random dataloader.")
+                    if not random_loader:
+                        viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size, shuffle=True, num_workers=1, collate_fn=list)
+                        random_loader = True
+                    loader = iter(viewpoint_stack_loader)
+                    torch.cuda.empty_cache()
+                    # Restart this accumulation step
+                    try:
+                        viewpoint_cam = next(loader)[0]
+                    except StopIteration:
+                        break
+            else:
+                # In-memory branch: pop a random camera
+                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+                if not viewpoint_stack:
+                    viewpoint_stack = temp_list.copy()
+
+            # ---- Render ONE image ----
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
+            image = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+
+            if scene.dataset_type != "PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
             else:
-                gt_image  = viewpoint_cam['image'].cuda()
-            
-            gt_images.append(gt_image.unsqueeze(0))
-            radii_list.append(radii.unsqueeze(0))
-            visibility_filter_list.append(visibility_filter.unsqueeze(0))
-            viewspace_point_tensor_list.append(viewspace_point_tensor)
-                
-        radii = torch.cat(radii_list,0).max(dim=0).values
-        visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
-        image_tensor = torch.cat(images,0)
-        gt_image_tensor = torch.cat(gt_images,0)
-        
-        # Clear intermediate lists to free memory
-        del images, gt_images, radii_list, visibility_filter_list
-        torch.cuda.empty_cache()
-        
-        dataset_length, C, H, W = image_tensor.shape
-        
-        # Reduced from 256 to 128 to save even more GPU memory
-        args.resize = 128
-        factor = args.resize / max(W, H)
-        factor = math.ceil(min(W, H) * factor / 64) * 64 / min(W, H)
-        new_width = int((W * factor) // 64) * 64
-        new_height = int((H * factor) // 64) * 64
-        #print(f"Resized dimensions: {new_height} x {new_width}") #768 x 1024
-        
-        vae_input_images = F.interpolate(image_tensor, size=(new_height, new_width), mode='bilinear', align_corners=False).to(device=device, dtype=torch_dtype)  # (N, C, RH, RW)
-        vae_input_images_cond = F.interpolate(gt_image_tensor, size=(new_height, new_width), mode='bilinear', align_corners=False).to(device=device, dtype=torch_dtype)  # (N, C, RH, RW)
-        
-        #print(vae_input_images.shape) # fx3x768x1024
-        
-        latents = encode_1(ip2p, vae_input_images)
-        image_latents = encode_2(ip2p, vae_input_images_cond)
-        
-        # Clear VAE input tensors to free memory
-        del vae_input_images, vae_input_images_cond
-        torch.cuda.empty_cache()
+                gt_image = viewpoint_cam['image'].cuda()
 
-        #print(latents.shape) # fx4x96x128
-        
-        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)  # (b, 4, f, h//4, w//4)
-        image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)  # (b, 4, f, h//4, w//4)
-        uncond_image_latents = torch.zeros_like(image_latents)
+            _, H, W = image.shape
 
-        prompt_embeds = ip2p._encode_prompt(
-            prompt,
-            device=device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True,
-        ) # [3b, 77, 768]
-        
-        ip2p.scheduler.config.num_train_timesteps = num_train_timesteps
-        ip2p.scheduler.set_timesteps(diffusion_step)
-        
-        noise = torch.randn_like(latents) # (b, 4, f, h//4, w//4)
-        t = torch.randint(
-            int(1000*0.02 - 1), #scheduler.config.num_train_timesteps
-            int(1000*0.98),
-            [1],
-            dtype=torch.long,
-            device=device,
-        )
-        latents = ip2p.scheduler.add_noise(latents, noise, t)  
-        #print("noise: ", noise.shape) # 1x4xfx96x128
-        
-        image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0) # (3b, 4, f, h//4, w//4)
+            # ---- Random patch crop (high resolution, low memory) ----
+            if H >= patch_size and W >= patch_size:
+                y0 = random.randint(0, H - patch_size)
+                x0 = random.randint(0, W - patch_size)
+                image_patch = image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)    # (1, 3, 256, 256)
+                gt_patch    = gt_image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)
+            else:
+                # Fallback: bilinear upsample if image is smaller than patch_size
+                image_patch = F.interpolate(image.unsqueeze(0),    size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                gt_patch    = F.interpolate(gt_image.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False)
 
-        latent_model_input = torch.cat([latents] * 3) # [3b, 4, sequence_length, h//4, w//4]
-        latent_model_input = torch.cat([latent_model_input, image_latents], dim=1) # [3b, 8, sequence_length, h//4, w//4]
-    
-        # predict the noise residual
-    
-        with torch.no_grad():
-            noise_pred = ip2p.unet(latent_model_input, t, prompt_embeds, None, None, False)[0] # [3b, 4, sequence_length, h//4, w//4]
+            image_patch = image_patch.to(device=device, dtype=torch_dtype)
+            gt_patch    = gt_patch.to(device=device, dtype=torch_dtype)
 
-            # perform classifier-free guidance
-            noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-            
-            noise_pred = (
-                noise_pred_uncond
-                + guidance_scale * (noise_pred_text - noise_pred_image)
-                + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-            )
-        
-        alphas = ip2p.scheduler.alphas_cumprod.to(device)
-        w = (1 - alphas[t]).view(-1, 1, 1, 1)
-        
-        grad = w * (noise_pred - noise)
-        grad = torch.nan_to_num(grad)
-        
-        target = (latents - grad).detach().to(dtype=torch.float16)
-        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / sequence_length
-        loss_sds = loss_sds.to(dtype=torch.float16)
-        #print("loss SDS: ", loss_sds)
-        # Loss
-        # breakpoint()
-        # Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+            # ---- Encode patches to latent space ----
+            latents       = encode_1(ip2p, image_patch)   # (1, 4, h/8, w/8)
+            image_latents = encode_2(ip2p, gt_patch)      # (1, 4, h/8, w/8)
 
-        psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
-        # norm
-        
-        loss = loss_sds
-        
-        # Clear intermediate tensors to save memory
-        del latents, image_latents, uncond_image_latents, prompt_embeds, noise, grad, target
-        torch.cuda.empty_cache()
-        
-        if stage == "fine" and hyper.time_smoothness_weight != 0:
-            tv_loss = 0
-            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-            loss += tv_loss
-        if opt.lambda_dssim != 0:
-            ssim_loss = ssim(image_tensor,gt_image_tensor)
-            loss += opt.lambda_dssim * (1.0-ssim_loss)
-        if opt.lambda_lpips !=0:
-            lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
-            loss += opt.lambda_lpips * lpipsloss
-        #print(loss)
-        loss.backward()
-        if torch.isnan(loss).any():
-            print("loss is nan,end training, reexecv program now.")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
-        for idx in range(0, len(viewspace_point_tensor_list)):
-            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+            # Add a frame dimension f=1 for the 3D UNet
+            latents       = rearrange(latents,       "(b f) c h w -> b c f h w", f=1).to(device=device, dtype=torch_dtype)
+            image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=1).to(device=device, dtype=torch_dtype)
+            uncond_image_latents = torch.zeros_like(image_latents)
+
+            # ---- Restrict noise timestep to [0.1, 0.6] to preserve structure ----
+            noise = torch.randn_like(latents)
+            t = torch.randint(int(1000*0.1), int(1000*0.6), [1], dtype=torch.long, device=device)
+            latents_noisy = ip2p.scheduler.add_noise(latents, noise, t)
+
+            # ---- Classifier-free guidance input ----
+            image_latents_cfg  = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)  # (3, 4, 1, h, w)
+            latent_model_input = torch.cat([latents_noisy] * 3)                                          # (3, 4, 1, h, w)
+            latent_model_input = torch.cat([latent_model_input, image_latents_cfg], dim=1)               # (3, 8, 1, h, w)
+
+            # ---- Noise prediction (no grad needed for UNet) ----
+            with torch.no_grad():
+                noise_pred = ip2p.unet(latent_model_input, t, prompt_embeds, None, None, False)[0]
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+
+                # Lowered guidance_scale to 7.5 to avoid over-saturation
+                guidance_scale_adjusted = 7.5
+                noise_pred = (
+                    noise_pred_uncond
+                    + guidance_scale_adjusted * (noise_pred_text  - noise_pred_image)
+                    + image_guidance_scale    * (noise_pred_image - noise_pred_uncond)
+                )
+
+            # ---- SDS gradient ----
+            alphas = ip2p.scheduler.alphas_cumprod.to(device)
+            w      = (1 - alphas[t]).view(-1, 1, 1, 1)
+            grad   = w * (noise_pred - noise)
+            grad   = torch.nan_to_num(grad)
+
+            target    = (latents_noisy - grad).detach().to(dtype=torch_dtype)
+            loss_sds  = 0.5 * F.mse_loss(latents_noisy, target, reduction="sum") / sequence_length
+
+            # L1 anchor loss: keeps rendered patches close to GT, preventing drift
+            l1_reg = F.l1_loss(image_patch, gt_patch) * 0.1 / sequence_length
+
+            loss = loss_sds + l1_reg
+            loss.backward()  # Accumulates into Gaussian parameter gradients
+
+            loss_log += loss.item()
+
+            # Track PSNR on the full rendered image (detached, no grad)
+            with torch.no_grad():
+                psnr_log += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+
+            # Accumulate viewspace point gradients for densification
+            if viewspace_point_tensor.grad is not None:
+                if viewspace_point_tensor_grad is None:
+                    viewspace_point_tensor_grad = viewspace_point_tensor.grad.clone()
+                else:
+                    viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor.grad
+
+            # Save latest camera's spatial stats for densification after the loop
+            last_visibility_filter      = visibility_filter
+            last_radii                  = radii
+            last_viewspace_point_tensor = viewspace_point_tensor
+
+            # Aggressive per-step memory cleanup
+            del image_patch, gt_patch, latents, latents_noisy, image_latents
+            del uncond_image_latents, noise, noise_pred, grad, target
+            del image_latents_cfg, latent_model_input
+            del render_pkg, image, gt_image, viewspace_point_tensor, visibility_filter, radii
+            torch.cuda.empty_cache()
+
+        # --- End of gradient accumulation loop ---
+
         iter_end.record()
+
+        psnr_ = psnr_log / sequence_length  # Average PSNR across accumulated views
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
+            ema_loss_for_log = 0.4 * loss_log + 0.6 * ema_loss_for_log
+            ema_psnr_for_log = 0.4 * float(psnr_) + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
-                                          "psnr": f"{psnr_:.{2}f}",
-                                          "point":f"{total_point}"})
+                progress_bar.set_postfix({
+                    "Loss":  f"{ema_loss_for_log:.{7}f}",
+                    "psnr":  f"{float(ema_psnr_for_log):.{2}f}",
+                    "point": f"{total_point}"
+                })
                 progress_bar.update(10)
-                # Aggressive memory clearing every 10 iterations
                 torch.cuda.empty_cache()
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
             timer.pause()
-            #training_report(tb_writer, iteration, loss_sds, loss, loss_sds, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save_refine(iteration, stage, prompt)
             if dataset.render_process:
                 if (iteration < 1000 and iteration % 10 == 9) \
                     or (iteration < 3000 and iteration % 50 == 49) \
-                        or (iteration < 60000 and iteration %  100 == 99) :
-                    # breakpoint()
-                        render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                        render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
-                        # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
-
-                    # total_images.append(to8b(temp_image).transpose(1,2,0))
+                        or (iteration < 60000 and iteration % 100 == 99):
+                    render_training_image(scene, gaussians, [test_cams[iteration % len(test_cams)]],  render, pipe, background, stage+"test",  iteration, timer.get_elapsed_time(), scene.dataset_type)
+                    render_training_image(scene, gaussians, [train_cams[iteration % len(train_cams)]], render, pipe, background, stage+"train", iteration, timer.get_elapsed_time(), scene.dataset_type)
             timer.start()
-            # Densification
-            if iteration < opt.densify_until_iter :
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                # Constrain Densification
-                gaussians.add_densification_stats(viewspace_point_tensor_grad * 0.000001, visibility_filter)
-                 
-                opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
-                densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
-                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<30000:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
-                    torch.cuda.empty_cache()  # Clear memory after densification
-                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>10000:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
+            # ---- Densification (uses accumulated gradients) ----
+            if last_visibility_filter is not None and iteration < opt.densify_until_iter:
+                gaussians.max_radii2D[last_visibility_filter] = torch.max(
+                    gaussians.max_radii2D[last_visibility_filter],
+                    last_radii[last_visibility_filter]
+                )
+                if viewspace_point_tensor_grad is not None:
+                    gaussians.add_densification_stats(viewspace_point_tensor_grad * 0.000001, last_visibility_filter)
+
+                opacity_threshold  = opt.opacity_threshold_fine_init  - iteration * (opt.opacity_threshold_fine_init  - opt.opacity_threshold_fine_after)  / opt.densify_until_iter
+                densify_threshold  = opt.densify_grad_threshold_fine_init - iteration * (opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after) / opt.densify_until_iter
+
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < 30000:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
+                    torch.cuda.empty_cache()
+
+                if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0] > 10000:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
-                    torch.cuda.empty_cache()  # Clear memory after pruning
-                    
-                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
-                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<30000 and opt.add_point:
-                    gaussians.grow(5,5,scene.model_path,iteration,stage)
-                    # torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
+
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0] < 30000 and opt.add_point:
+                    gaussians.grow(5, 5, scene.model_path, iteration, stage)
+
                 if iteration % opt.opacity_reset_interval == 0:
                     print("reset opacity")
                     gaussians.reset_opacity()
-            
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+        # ---- Optimizer step ONCE after the full accumulation loop ----
+        if iteration < opt.iterations:
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+
+        if (iteration in checkpoint_iterations):
+            print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + f"_{stage}_" + str(iteration) + ".pth")
+
+
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, prompt, guidance_scale, image_guidance_scale):
-    # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
     dataset.model_path = args.model_path
@@ -462,13 +429,11 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     print(f"Loaded ply from {args.ply_path}")
     
     # Load deformation from the same directory as the ply file.
-    # This ensures point counts match (e.g. after densification in the 3D edit step).
-    _ply_iter_dir = os.path.dirname(args.ply_path)  # .../iteration_XXXXX
+    _ply_iter_dir = os.path.dirname(args.ply_path)
     if os.path.exists(os.path.join(_ply_iter_dir, "deformation.pth")):
         print(f"Loading deformation from ply directory: {_ply_iter_dir}")
         gaussians.load_model(_ply_iter_dir)
     else:
-        # Fallback: load from the original training checkpoint (highest iteration)
         print(f"No deformation.pth in {_ply_iter_dir}, falling back to original training checkpoint")
         point_cloud_dir = os.path.join(args.model_path, "point_cloud")
         iterations = []
@@ -485,57 +450,51 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
         print(f"Loading deformation from: {point_cloud_dir}/iteration_{latest_iter}")
         gaussians.load_model(os.path.join(point_cloud_dir, f"iteration_{latest_iter}"))
 
-    gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]),device="cuda"),0)
+    gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]), device="cuda"), 0)
     print("Loaded deformation field")
     timer.start()
     
-    #FOR EDIT
+    # Load IP2P
     seed_everything(20211202)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = torch.float16
 
     DDIM_SOURCE = "CompVis/stable-diffusion-v1-4"
     IP2P_SOURCE = "timbrooks/instruct-pix2pix"
-    tokenizer = CLIPTokenizer.from_pretrained(IP2P_SOURCE, subfolder="tokenizer")
+    tokenizer    = CLIPTokenizer.from_pretrained(IP2P_SOURCE, subfolder="tokenizer")
     sys.stdout.isatty = lambda: False
     text_encoder = CLIPTextModel.from_pretrained(IP2P_SOURCE, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(IP2P_SOURCE, subfolder="vae")
-    unet = UNet3DConditionModel.from_pretrained_2d(IP2P_SOURCE, subfolder="unet")
+    vae          = AutoencoderKL.from_pretrained(IP2P_SOURCE, subfolder="vae")
+    unet         = UNet3DConditionModel.from_pretrained_2d(IP2P_SOURCE, subfolder="unet")
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
 
-    vae = vae.to(device, dtype=torch_dtype)
+    vae          = vae.to(device, dtype=torch_dtype)
     text_encoder = text_encoder.to(device, dtype=torch_dtype)
-    unet = unet.to(device, dtype=torch_dtype)
+    unet         = unet.to(device, dtype=torch_dtype)
             
     ip2p = InstructPix2PixPipeline(
-            vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
-            scheduler=DDIMScheduler.from_pretrained(DDIM_SOURCE, subfolder="scheduler"),
-        )
+        vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
+        scheduler=DDIMScheduler.from_pretrained(DDIM_SOURCE, subfolder="scheduler"),
+    )
     print("Ready IP2P")
 
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, "fine", tb_writer, 800, timer, ip2p, prompt, guidance_scale, image_guidance_scale)
 
+
 def prepare_output_and_logger(expname):    
     if not args.model_path:
-        # if os.getenv('OAR_JOB_ID'):
-        #     unique_str=os.getenv('OAR_JOB_ID')
-        # else:
-        #     unique_str = str(uuid.uuid4())
         unique_str = expname
-
         args.model_path = os.path.join("./output/", unique_str)
-    # Set up output folder
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
+    os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -543,83 +502,78 @@ def prepare_output_and_logger(expname):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, stage, dataset_type):
+
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs, stage, dataset_type):
     if tb_writer:
         tb_writer.add_scalar(f'{stage}/train_loss_patches/sds_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
+        tb_writer.add_scalar(f'{stage}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
-        
-    
-    # Report test and samples of training set
+
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        # 
-        validation_configs = ({'name': 'test', 'cameras' : [scene.getTestCameras()[idx % len(scene.getTestCameras())] for idx in range(10, 5000, 299)]},
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(10, 5000, 299)]})
+        validation_configs = (
+            {'name': 'test',  'cameras': [scene.getTestCameras()[idx  % len(scene.getTestCameras())]  for idx in range(10, 5000, 299)]},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(10, 5000, 299)]},
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
+                l1_test   = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians,stage=stage, cam_type=dataset_type, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, stage=stage, cam_type=dataset_type, *renderArgs)["render"], 0.0, 1.0)
                     if dataset_type == "PanopticSports":
                         gt_image = torch.clamp(viewpoint["image"].to("cuda"), 0.0, 1.0)
                     else:
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     try:
                         if tb_writer and (idx < 5):
-                            tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                            tb_writer.add_images(stage + "/" + config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                             if iteration == testing_iterations[0]:
-                                tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                                tb_writer.add_images(stage + "/" + config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     except:
                         pass
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    # mask=viewpoint.mask
-                    
+                    l1_test   += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image, mask=None).mean().double()
+
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                l1_test   /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                # print("sh feature",scene.gaussians.get_features.shape)
                 if tb_writer:
-                    tb_writer.add_scalar(stage + "/"+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(stage+"/"+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(stage + "/" + config['name'] + '/loss_viewpoint - l1_loss', l1_test,   iteration)
+                    tb_writer.add_scalar(stage + "/" + config['name'] + '/loss_viewpoint - psnr',    psnr_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            
-            tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration,max_bins=500)
+            tb_writer.add_scalar(f'{stage}/total_points',    scene.gaussians.get_xyz.shape[0], iteration)
+            tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum() / scene.gaussians.get_xyz.shape[0], iteration)
+            tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1) / 100, iteration, max_bins=500)
         
         torch.cuda.empty_cache()
 
+
 if __name__ == "__main__":
-    # Set up command line argument parser
-    # torch.set_default_tensor_type('torch.FloatTensor')
     torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
 
     lp = ModelParams(parser)
-    op = OptimizationParams(parser) #
+    op = OptimizationParams(parser)
     pp = PipelineParams(parser)
     hp = ModelHiddenParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--ip',   type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000, 5000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 300, 500, 800, 1000,1500,2000,3000,5000])
+    parser.add_argument("--test_iterations",       nargs="+", type=int, default=[3000, 5000])
+    parser.add_argument("--save_iterations",       nargs="+", type=int, default=[100, 300, 500, 800, 1000, 1500, 2000, 3000, 5000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--expname", type=str, default = "")
-    parser.add_argument("--configs", type=str, default = "")
-    
-    parser.add_argument("--ply_path", type=str, default = "")
-    parser.add_argument("--prompt", type=str, default = "")
-    parser.add_argument('--guidance_scale', type=float, default=10.5)
+    parser.add_argument("--start_checkpoint",      type=str,  default=None)
+    parser.add_argument("--expname",   type=str, default="")
+    parser.add_argument("--configs",   type=str, default="")
+    parser.add_argument("--ply_path",  type=str, default="")
+    parser.add_argument("--prompt",    type=str, default="")
+    parser.add_argument('--guidance_scale',       type=float, default=10.5)
     parser.add_argument('--image_guidance_scale', type=float, default=1.2)
 
     args = parser.parse_args(sys.argv[1:])
@@ -631,14 +585,14 @@ if __name__ == "__main__":
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.prompt, args.guidance_scale, args.image_guidance_scale)
+    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+             args.start_checkpoint, args.debug_from, args.expname, args.prompt,
+             args.guidance_scale, args.image_guidance_scale)
 
-    # All done
     print("\nEditing complete.")
