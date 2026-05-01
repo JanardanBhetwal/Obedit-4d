@@ -99,10 +99,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     torch_dtype = torch.float16
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # --- PATCH-BASED SDS SETTINGS ---
-    # sequence_length: number of gradient accumulation steps (effective batch size)
-    sequence_length = 4   # Accumulate gradients over 4 views before stepping
-    patch_size = 256      # High-res random crop; avoids downscaling the whole image
+    # --- SPEED & MEMORY EFFICIENCY SETTINGS ---
+    sequence_length = 4   # 4 views batched into a single 3D UNet pass
+    patch_size = 256      # High-res random crop; avoids downscaling entire images
 
     diffusion_step = 20
     num_train_timesteps = 1000
@@ -111,6 +110,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     first_iter = 0
     gaussians.training_only3dgs_setup(opt)
 
+    # FREEZE XYZ to prevent 4DGS motion misalignment
     for param_group in gaussians.optimizer.param_groups:
         if param_group["name"] == "xyz":
             param_group["lr"] = 0.0
@@ -196,7 +196,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 network_gui.conn = None
 
         iter_start.record()
-
         gaussians.update_learning_rate(iteration)
 
         if iteration % 1000 == 0:
@@ -206,154 +205,144 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             pipe.debug = True
 
         # -----------------------------------------------------------------------
-        # PATCH-BASED SDS + GRADIENT ACCUMULATION
+        # BATCHED FAST LOOP (High Speed, Minimal Memory)
         # -----------------------------------------------------------------------
-        # Zero gradients ONCE before the accumulation loop
         gaussians.optimizer.zero_grad(set_to_none=True)
 
-        loss_log = 0.0
+        images_patch_list = []
+        gt_patch_list = []
+        viewspace_point_tensor_list = []
+        visibility_filter_list = []
+        radii_list = []
+        
         psnr_log = 0.0
-        viewspace_point_tensor_grad = None
 
-        # Keep track of last-seen visibility info for densification
-        last_visibility_filter = None
-        last_radii = None
-        last_viewspace_point_tensor = None
-
+        # 1. FAST RENDER & CROP LOOP
         for seq_idx in range(sequence_length):
-
-            # ---- Pick ONE camera ----
             if opt.dataloader and not load_in_memory:
-                # Dataloader branch: pull a single camera from the loader
                 try:
                     viewpoint_cam = next(loader)[0]
                 except StopIteration:
-                    print("reset dataloader into random dataloader.")
                     if not random_loader:
                         viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size, shuffle=True, num_workers=1, collate_fn=list)
                         random_loader = True
                     loader = iter(viewpoint_stack_loader)
                     torch.cuda.empty_cache()
-                    # Restart this accumulation step
                     try:
                         viewpoint_cam = next(loader)[0]
                     except StopIteration:
                         break
             else:
-                # In-memory branch: pop a random camera
                 viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
                 if not viewpoint_stack:
                     viewpoint_stack = temp_list.copy()
 
-            # ---- Render ONE image ----
+            # Render
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage, cam_type=scene.dataset_type)
             image = render_pkg["render"]
             viewspace_point_tensor = render_pkg["viewspace_points"]
             visibility_filter = render_pkg["visibility_filter"]
             radii = render_pkg["radii"]
 
-            if scene.dataset_type != "PanopticSports":
-                gt_image = viewpoint_cam.original_image.cuda()
-            else:
-                gt_image = viewpoint_cam['image'].cuda()
-
-            _, H, W = image.shape
-
-            # ---- Random patch crop (high resolution, low memory) ----
-            if H >= patch_size and W >= patch_size:
-                y0 = random.randint(0, H - patch_size)
-                x0 = random.randint(0, W - patch_size)
-                image_patch = image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)    # (1, 3, 256, 256)
-                gt_patch    = gt_image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)
-            else:
-                # Fallback: bilinear upsample if image is smaller than patch_size
-                image_patch = F.interpolate(image.unsqueeze(0),    size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                gt_patch    = F.interpolate(gt_image.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-
-            image_patch = image_patch.to(device=device, dtype=torch_dtype)
-            gt_patch    = gt_patch.to(device=device, dtype=torch_dtype)
-
-            # ---- Encode patches to latent space ----
-            latents       = encode_1(ip2p, image_patch)   # (1, 4, h/8, w/8)
-            image_latents = encode_2(ip2p, gt_patch)      # (1, 4, h/8, w/8)
-
-            # Add a frame dimension f=1 for the 3D UNet
-            latents       = rearrange(latents,       "(b f) c h w -> b c f h w", f=1).to(device=device, dtype=torch_dtype)
-            image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=1).to(device=device, dtype=torch_dtype)
-            uncond_image_latents = torch.zeros_like(image_latents)
-
-            # ---- Restrict noise timestep to [0.1, 0.6] to preserve structure ----
-            noise = torch.randn_like(latents)
-            t = torch.randint(int(1000*0.1), int(1000*0.6), [1], dtype=torch.long, device=device)
-            latents_noisy = ip2p.scheduler.add_noise(latents, noise, t)
-
-            # ---- Classifier-free guidance input ----
-            image_latents_cfg  = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)  # (3, 4, 1, h, w)
-            latent_model_input = torch.cat([latents_noisy] * 3)                                          # (3, 4, 1, h, w)
-            latent_model_input = torch.cat([latent_model_input, image_latents_cfg], dim=1)               # (3, 8, 1, h, w)
-
-            # ---- Noise prediction (no grad needed for UNet) ----
-            with torch.no_grad():
-                noise_pred = ip2p.unet(latent_model_input, t, prompt_embeds, None, None, False)[0]
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-
-                # Lowered guidance_scale to 7.5 to avoid over-saturation
-                guidance_scale_adjusted = 7.5
-                noise_pred = (
-                    noise_pred_uncond
-                    + guidance_scale_adjusted * (noise_pred_text  - noise_pred_image)
-                    + image_guidance_scale    * (noise_pred_image - noise_pred_uncond)
-                )
-
-            # ---- SDS gradient ----
-            alphas = ip2p.scheduler.alphas_cumprod.to(device)
-            w      = (1 - alphas[t]).view(-1, 1, 1, 1)
-            grad   = w * (noise_pred - noise)
-            grad   = torch.nan_to_num(grad)
-
-            target    = (latents_noisy - grad).detach().to(dtype=torch_dtype)
-            loss_sds  = 0.5 * F.mse_loss(latents_noisy, target, reduction="sum") / sequence_length
-
-            # L1 anchor loss: keeps rendered patches close to GT, preventing drift
-            l1_reg = F.l1_loss(image_patch, gt_patch) * 0.1 / sequence_length
-
-            loss = loss_sds + l1_reg
-            loss.backward()  # Accumulates into Gaussian parameter gradients
-
-            loss_log += loss.item()
-
-            # Track PSNR on the full rendered image (detached, no grad)
+            gt_image = viewpoint_cam.original_image.cuda() if scene.dataset_type != "PanopticSports" else viewpoint_cam['image'].cuda()
+            
+            # Calculate PSNR on full resolution to log
             with torch.no_grad():
                 psnr_log += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
 
-            # Accumulate viewspace point gradients for densification
-            if viewspace_point_tensor.grad is not None:
-                if viewspace_point_tensor_grad is None:
-                    viewspace_point_tensor_grad = viewspace_point_tensor.grad.clone()
-                else:
-                    viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor.grad
+            _, H, W = image.shape
 
-            # Save latest camera's spatial stats for densification after the loop
-            last_visibility_filter      = visibility_filter
-            last_radii                  = radii
-            last_viewspace_point_tensor = viewspace_point_tensor
+            # Crop 256x256
+            if H >= patch_size and W >= patch_size:
+                y0 = random.randint(0, H - patch_size)
+                x0 = random.randint(0, W - patch_size)
+                image_patch = image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)
+                gt_patch    = gt_image[:, y0:y0+patch_size, x0:x0+patch_size].unsqueeze(0)
+            else:
+                image_patch = F.interpolate(image.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                gt_patch    = F.interpolate(gt_image.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False)
 
-            # Aggressive per-step memory cleanup
-            del image_patch, gt_patch, latents, latents_noisy, image_latents
-            del uncond_image_latents, noise, noise_pred, grad, target
-            del image_latents_cfg, latent_model_input
-            del render_pkg, image, gt_image, viewspace_point_tensor, visibility_filter, radii
-            torch.cuda.empty_cache()
+            images_patch_list.append(image_patch)
+            gt_patch_list.append(gt_patch)
+            viewspace_point_tensor_list.append(viewspace_point_tensor)
+            visibility_filter_list.append(visibility_filter.unsqueeze(0))
+            radii_list.append(radii.unsqueeze(0))
+            
+            # CRITICAL: Free full resolution images immediately to preserve VRAM!
+            del image, gt_image, render_pkg
+            
+        # 2. BATCH TENSORS
+        image_tensor = torch.cat(images_patch_list, 0).to(device=device, dtype=torch_dtype)
+        gt_image_tensor = torch.cat(gt_patch_list, 0).to(device=device, dtype=torch_dtype)
+        radii_batch = torch.cat(radii_list, 0).max(dim=0).values
+        visibility_filter_batch = torch.cat(visibility_filter_list).any(dim=0)
+        
+        # 3. VAE ENCODE (Batched)
+        latents = encode_1(ip2p, image_tensor)
+        image_latents = encode_2(ip2p, gt_image_tensor)
+        
+        # Reshape for 3D UNet: b=1, c=4, f=sequence_length
+        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)
+        image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)
+        uncond_image_latents = torch.zeros_like(image_latents)
 
-        # --- End of gradient accumulation loop ---
+        # 4. TIMESTEP ANNEALING (Linear decay from 0.6 -> 0.2)
+        progress_ratio = iteration / float(opt.iterations)
+        max_t = 0.6 - (0.4 * progress_ratio) 
+        min_t = 0.1
+        
+        noise = torch.randn_like(latents)
+        t = torch.randint(int(1000 * min_t), int(1000 * max_t), [1], dtype=torch.long, device=device)
+        latents_noisy = ip2p.scheduler.add_noise(latents, noise, t)
+        
+        image_latents_cfg = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
+        latent_model_input = torch.cat([latents_noisy] * 3)
+        latent_model_input = torch.cat([latent_model_input, image_latents_cfg], dim=1)
 
+        # 5. UNET FORWARD PASS (Single batched run)
+        with torch.no_grad():
+            noise_pred = ip2p.unet(latent_model_input, t, prompt_embeds, None, None, False)[0]
+            noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+            
+            guidance_scale_adjusted = min(guidance_scale, 8.0) # Limit over-saturation
+            noise_pred = (
+                noise_pred_uncond
+                + guidance_scale_adjusted * (noise_pred_text - noise_pred_image)
+                + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            )
+
+        alphas = ip2p.scheduler.alphas_cumprod.to(device)
+        w = (1 - alphas[t]).view(-1, 1, 1, 1)
+        grad = w * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+        
+        target = (latents - grad).detach().to(dtype=torch_dtype)
+        
+        # 6. LOSS & BACKWARD
+        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / sequence_length
+        l1_reg = F.l1_loss(image_tensor, gt_image_tensor) * 0.1 # Anchors geometry
+        
+        loss = loss_sds + l1_reg
+        loss.backward()
+        
+        # Accumulate viewspace gradients for densification
+        viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor_list[0])
+        for idx in range(len(viewspace_point_tensor_list)):
+            if viewspace_point_tensor_list[idx].grad is not None:
+                viewspace_point_tensor_grad += viewspace_point_tensor_list[idx].grad
+                
         iter_end.record()
+        
+        # CLEANUP (Crucial for next iteration)
+        del images_patch_list, gt_patch_list, viewspace_point_tensor_list
+        del image_tensor, gt_image_tensor, latents, image_latents, uncond_image_latents
+        del noise, latents_noisy, latent_model_input, noise_pred, grad, target
+        torch.cuda.empty_cache()
 
-        psnr_ = psnr_log / sequence_length  # Average PSNR across accumulated views
+        psnr_ = psnr_log / sequence_length
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss_log + 0.6 * ema_loss_for_log
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * float(psnr_) + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
             if iteration % 10 == 0:
@@ -363,11 +352,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     "point": f"{total_point}"
                 })
                 progress_bar.update(10)
-                torch.cuda.empty_cache()
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             timer.pause()
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -380,14 +367,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     render_training_image(scene, gaussians, [train_cams[iteration % len(train_cams)]], render, pipe, background, stage+"train", iteration, timer.get_elapsed_time(), scene.dataset_type)
             timer.start()
 
-            # ---- Densification (uses accumulated gradients) ----
-            if last_visibility_filter is not None and iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[last_visibility_filter] = torch.max(
-                    gaussians.max_radii2D[last_visibility_filter],
-                    last_radii[last_visibility_filter]
+            # 7. DENSIFICATION & OPTIMIZER STEP
+            if iteration < opt.densify_until_iter:
+                gaussians.max_radii2D[visibility_filter_batch] = torch.max(
+                    gaussians.max_radii2D[visibility_filter_batch],
+                    radii_batch[visibility_filter_batch]
                 )
-                if viewspace_point_tensor_grad is not None:
-                    gaussians.add_densification_stats(viewspace_point_tensor_grad * 0.000001, last_visibility_filter)
+                gaussians.add_densification_stats(viewspace_point_tensor_grad * 0.000001, visibility_filter_batch)
 
                 opacity_threshold  = opt.opacity_threshold_fine_init  - iteration * (opt.opacity_threshold_fine_init  - opt.opacity_threshold_fine_after)  / opt.densify_until_iter
                 densify_threshold  = opt.densify_grad_threshold_fine_init - iteration * (opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after) / opt.densify_until_iter
@@ -409,7 +395,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     print("reset opacity")
                     gaussians.reset_opacity()
 
-        # ---- Optimizer step ONCE after the full accumulation loop ----
         if iteration < opt.iterations:
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
@@ -428,7 +413,6 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     gaussians.load_ply(args.ply_path)
     print(f"Loaded ply from {args.ply_path}")
     
-    # Load deformation from the same directory as the ply file.
     _ply_iter_dir = os.path.dirname(args.ply_path)
     if os.path.exists(os.path.join(_ply_iter_dir, "deformation.pth")):
         print(f"Loading deformation from ply directory: {_ply_iter_dir}")
@@ -454,7 +438,6 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     print("Loaded deformation field")
     timer.start()
     
-    # Load IP2P
     seed_everything(20211202)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch_dtype = torch.float16
