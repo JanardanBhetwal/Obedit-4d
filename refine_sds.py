@@ -359,16 +359,16 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         del latents, image_latents, uncond_image_latents, prompt_embeds, noise, grad, target
         torch.cuda.empty_cache()
         
-        #if stage == "fine" and hyper.time_smoothness_weight != 0:
-            # tv_loss = 0
-        #     tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-        #    loss += tv_loss
-        # if opt.lambda_dssim != 0:
-        #    ssim_loss = ssim(image_tensor,gt_image_tensor)
-        #    loss += opt.lambda_dssim * (1.0-ssim_loss)
-        # if opt.lambda_lpips !=0:
-        #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
-        #     loss += opt.lambda_lpips * lpipsloss
+        if stage == "fine" and hyper.time_smoothness_weight != 0:
+            tv_loss = 0
+            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
+            loss += tv_loss
+        if opt.lambda_dssim != 0:
+            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            loss += opt.lambda_dssim * (1.0-ssim_loss)
+        if opt.lambda_lpips !=0:
+            lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
+            loss += opt.lambda_lpips * lpipsloss
         #print(loss)
         loss.backward()
         if torch.isnan(loss).any():
