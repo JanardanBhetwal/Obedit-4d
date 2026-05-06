@@ -10,32 +10,35 @@
 #
 import math
 import imageio
-from matplotlib import pyplot as plt
 import numpy as np
 import torch
 from scene import Scene
 import os
-import cv2
 from tqdm import tqdm
-from os import makedirs
-from gaussian_renderer import render
-import torchvision
 from utils.general_utils import safe_state
+from utils.graphics_utils import getProjectionMatrix
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
-from time import time
-import threading
-import concurrent.futures
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from sklearn.neighbors import NearestNeighbors
 
-def render_edited(gaussians, viewpoint_camera, mask=None):
+def to8b(x):
+    return (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
+
+def render_edited(gaussians, viewpoint_camera, zoom_factor=1.05, mask=None):
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    zoom_factor = max(1.0, float(zoom_factor))
     # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    zoomed_fovx = viewpoint_camera.FoVx / zoom_factor
+    zoomed_fovy = viewpoint_camera.FoVy / zoom_factor
+    tanfovx = math.tan(zoomed_fovx * 0.5)
+    tanfovy = math.tan(zoomed_fovy * 0.5)
+    world_view_transform = viewpoint_camera.world_view_transform.cuda()
+    znear = getattr(viewpoint_camera, "znear", 0.01)
+    zfar = getattr(viewpoint_camera, "zfar", 100.0)
+    projection_matrix = getProjectionMatrix(znear=znear, zfar=zfar, fovX=zoomed_fovx, fovY=zoomed_fovy).transpose(0, 1).to(world_view_transform.device)
+    full_proj_transform = world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0)).squeeze(0)
     
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(gaussians.get_xyz, dtype=gaussians.get_xyz.dtype, requires_grad=True, device="cuda") + 0   
@@ -47,8 +50,8 @@ def render_edited(gaussians, viewpoint_camera, mask=None):
             tanfovy=tanfovy,
             bg=background,
             scale_modifier=1.0,
-            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
-            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+            viewmatrix=world_view_transform,
+            projmatrix=full_proj_transform,
             sh_degree=gaussians.active_sh_degree,
             campos=viewpoint_camera.camera_center.cuda(),
             prefiltered=False,
@@ -64,10 +67,10 @@ def render_edited(gaussians, viewpoint_camera, mask=None):
     shs = gaussians.get_features      
     ############################################################################################
     #scene.getTrainCameras()[300].time
-    time=torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+    time_cond = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
     means3D_final, scales_final, rotations_final, opacity_final, shs_final = gaussians._deformation(means3D, scales, 
                                                                  rotations, opacity, shs,
-                                                                 time)
+                                                                 time_cond)
         
     scales_final = gaussians.scaling_activation(scales_final)
     rotations_final = gaussians.rotation_activation(rotations_final)
@@ -110,6 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_video", action="store_true")
     parser.add_argument("--configs", type=str)
     parser.add_argument("--ply_path", type=str)
+    parser.add_argument("--render_zoom", type=float, default=1.05, help="Virtual zoom factor for PLY rendering. Values > 1.0 narrow the FoV and crop edge noise.")
     parser.add_argument("--prompt", type=str, default=None, help="Edit prompt (used for output filename)")
     args = get_combined_args(parser)
     print("Rendering " , args.ply_path)
@@ -165,9 +169,8 @@ if __name__ == "__main__":
     ## VideoCameras: moving camera / TestCameras: fixed camera (for DyNeRF)
     cameras = scene.getVideoCameras()
     imgs = []
-    to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
     for idx, viewpoint_camera in enumerate(tqdm(cameras, desc="Rendering progress")):
-        rendered_img = render_edited(gaussians, viewpoint_camera)
+        rendered_img = render_edited(gaussians, viewpoint_camera, zoom_factor=args.render_zoom)
         imgs.append(to8b(rendered_img.detach().cpu()).transpose(1,2,0))
 
     ## Determine a prompt-based filename so different prompts don't overwrite each other
@@ -187,6 +190,7 @@ if __name__ == "__main__":
     else:
         safe_prompt = "unknown_prompt"
     scene_name = os.path.splitext(os.path.basename(args.configs))[0]
-    video_path = os.path.join(args.model_path, f"edited_{scene_name}_{safe_prompt}.mp4")
+    zoom_tag = "" if abs(args.render_zoom - 1.0) < 1e-6 else f"_zoom{str(args.render_zoom).replace('.', 'p')}"
+    video_path = os.path.join(args.model_path, f"edited_{scene_name}_{safe_prompt}{zoom_tag}.mp4")
     imageio.mimwrite(video_path, imgs, fps=30)
     print(f"Video Saved: {video_path}")
