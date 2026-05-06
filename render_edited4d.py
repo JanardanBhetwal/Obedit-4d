@@ -16,7 +16,6 @@ from scene import Scene
 import os
 from tqdm import tqdm
 from utils.general_utils import safe_state
-from utils.graphics_utils import getProjectionMatrix
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
@@ -29,29 +28,29 @@ def render_edited(gaussians, viewpoint_camera, zoom_factor=1.05, mask=None):
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     zoom_factor = max(1.0, float(zoom_factor))
-    # Set up rasterization configuration
-    zoomed_fovx = viewpoint_camera.FoVx / zoom_factor
-    zoomed_fovy = viewpoint_camera.FoVy / zoom_factor
-    tanfovx = math.tan(zoomed_fovx * 0.5)
-    tanfovy = math.tan(zoomed_fovy * 0.5)
-    world_view_transform = viewpoint_camera.world_view_transform.cuda()
-    znear = getattr(viewpoint_camera, "znear", 0.01)
-    zfar = getattr(viewpoint_camera, "zfar", 100.0)
-    projection_matrix = getProjectionMatrix(znear=znear, zfar=zfar, fovX=zoomed_fovx, fovY=zoomed_fovy).transpose(0, 1).to(world_view_transform.device)
-    full_proj_transform = world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0)).squeeze(0)
+    
+    # When zoom_factor > 1.0, render at a smaller resolution to crop edge noise
+    # e.g., zoom_factor=1.05 renders at 95% of the original size, then we upscale
+    render_scale = 1.0 / zoom_factor
+    render_height = int(viewpoint_camera.image_height * render_scale)
+    render_width = int(viewpoint_camera.image_width * render_scale)
+    
+    # Set up rasterization configuration with original FoV
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(gaussians.get_xyz, dtype=gaussians.get_xyz.dtype, requires_grad=True, device="cuda") + 0   
 
     raster_settings = GaussianRasterizationSettings(
-            image_height=int(viewpoint_camera.image_height),
-            image_width=int(viewpoint_camera.image_width),
+            image_height=render_height,
+            image_width=render_width,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
             bg=background,
             scale_modifier=1.0,
-            viewmatrix=world_view_transform,
-            projmatrix=full_proj_transform,
+            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
+            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
             sh_degree=gaussians.active_sh_degree,
             campos=viewpoint_camera.camera_center.cuda(),
             prefiltered=False,
@@ -97,6 +96,15 @@ def render_edited(gaussians, viewpoint_camera, zoom_factor=1.05, mask=None):
             scales = scales_final[mask],
             rotations = rotations_final[mask],
             cov3D_precomp = None)
+    
+    # If zoom was applied, upscale the rendered image back to original resolution
+    if abs(zoom_factor - 1.0) > 1e-6:
+        rendered_image = torch.nn.functional.interpolate(
+            rendered_image.unsqueeze(0),
+            size=(int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
     
     return rendered_image
 
