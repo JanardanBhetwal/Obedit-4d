@@ -10,30 +10,32 @@
 #
 import math
 import imageio
-from matplotlib import pyplot as plt
 import numpy as np
 import torch
 from scene import Scene
 import os
-import cv2
 from tqdm import tqdm
-from os import makedirs
-from gaussian_renderer import render
-import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
-from time import time
-import threading
-import concurrent.futures
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from sklearn.neighbors import NearestNeighbors
 
-def render_edited(gaussians, viewpoint_camera, mask=None):
+def to8b(x):
+    return (255 * np.clip(x.cpu().numpy(), 0, 1)).astype(np.uint8)
+
+def render_edited(gaussians, viewpoint_camera, zoom_factor=1.05, mask=None):
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    # Set up rasterization configuration
+    zoom_factor = max(1.0, float(zoom_factor))
+    
+    # When zoom_factor > 1.0, render at a smaller resolution to crop edge noise
+    # e.g., zoom_factor=1.05 renders at 95% of the original size, then we upscale
+    render_scale = 1.0 / zoom_factor
+    render_height = int(viewpoint_camera.image_height * render_scale)
+    render_width = int(viewpoint_camera.image_width * render_scale)
+    
+    # Set up rasterization configuration with original FoV
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     
@@ -41,8 +43,8 @@ def render_edited(gaussians, viewpoint_camera, mask=None):
     screenspace_points = torch.zeros_like(gaussians.get_xyz, dtype=gaussians.get_xyz.dtype, requires_grad=True, device="cuda") + 0   
 
     raster_settings = GaussianRasterizationSettings(
-            image_height=int(viewpoint_camera.image_height),
-            image_width=int(viewpoint_camera.image_width),
+            image_height=render_height,
+            image_width=render_width,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
             bg=background,
@@ -64,10 +66,10 @@ def render_edited(gaussians, viewpoint_camera, mask=None):
     shs = gaussians.get_features      
     ############################################################################################
     #scene.getTrainCameras()[300].time
-    time=torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+    time_cond = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
     means3D_final, scales_final, rotations_final, opacity_final, shs_final = gaussians._deformation(means3D, scales, 
                                                                  rotations, opacity, shs,
-                                                                 time)
+                                                                 time_cond)
         
     scales_final = gaussians.scaling_activation(scales_final)
     rotations_final = gaussians.rotation_activation(rotations_final)
@@ -95,6 +97,15 @@ def render_edited(gaussians, viewpoint_camera, mask=None):
             rotations = rotations_final[mask],
             cov3D_precomp = None)
     
+    # If zoom was applied, upscale the rendered image back to original resolution
+    if abs(zoom_factor - 1.0) > 1e-6:
+        rendered_image = torch.nn.functional.interpolate(
+            rendered_image.unsqueeze(0),
+            size=(int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+    
     return rendered_image
 
 if __name__ == "__main__":
@@ -110,6 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_video", action="store_true")
     parser.add_argument("--configs", type=str)
     parser.add_argument("--ply_path", type=str)
+    parser.add_argument("--render_zoom", type=float, default=1.05, help="Virtual zoom factor for PLY rendering. Values > 1.0 narrow the FoV and crop edge noise.")
     parser.add_argument("--prompt", type=str, default=None, help="Edit prompt (used for output filename)")
     args = get_combined_args(parser)
     print("Rendering " , args.ply_path)
@@ -165,9 +177,8 @@ if __name__ == "__main__":
     ## VideoCameras: moving camera / TestCameras: fixed camera (for DyNeRF)
     cameras = scene.getVideoCameras()
     imgs = []
-    to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
     for idx, viewpoint_camera in enumerate(tqdm(cameras, desc="Rendering progress")):
-        rendered_img = render_edited(gaussians, viewpoint_camera)
+        rendered_img = render_edited(gaussians, viewpoint_camera, zoom_factor=args.render_zoom)
         imgs.append(to8b(rendered_img.detach().cpu()).transpose(1,2,0))
 
     ## Determine a prompt-based filename so different prompts don't overwrite each other
@@ -187,6 +198,7 @@ if __name__ == "__main__":
     else:
         safe_prompt = "unknown_prompt"
     scene_name = os.path.splitext(os.path.basename(args.configs))[0]
-    video_path = os.path.join(args.model_path, f"edited_{scene_name}_{safe_prompt}.mp4")
+    zoom_tag = "" if abs(args.render_zoom - 1.0) < 1e-6 else f"_zoom{str(args.render_zoom).replace('.', 'p')}"
+    video_path = os.path.join(args.model_path, f"edited_{scene_name}_{safe_prompt}{zoom_tag}.mp4")
     imageio.mimwrite(video_path, imgs, fps=30)
     print(f"Video Saved: {video_path}")
