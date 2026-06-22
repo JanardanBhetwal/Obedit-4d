@@ -6,3 +6,7 @@ huggingface-hub==0.19.4
 einops==0.6.1
 pytorch-lightning==2.1.0
 moviepy
+opencv-python
+pillow
+numpy
+git+https://github.com/facebookresearch/segment-anything-2.git
