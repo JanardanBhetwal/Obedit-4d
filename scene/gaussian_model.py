@@ -255,13 +255,22 @@ class GaussianModel:
         weight_dict = torch.load(os.path.join(path,"deformation.pth"),map_location="cuda")
         self._deformation.load_state_dict(weight_dict)
         self._deformation = self._deformation.to("cuda")
-        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
-        self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+        num_pts = self.get_xyz.shape[0]
+        self._deformation_table = torch.gt(torch.ones((num_pts,),device="cuda"),0)
+        self._deformation_accum = torch.zeros((num_pts,3),device="cuda")
         if os.path.exists(os.path.join(path, "deformation_table.pth")):
-            self._deformation_table = torch.load(os.path.join(path, "deformation_table.pth"),map_location="cuda")
+            loaded_table = torch.load(os.path.join(path, "deformation_table.pth"),map_location="cuda")
+            if loaded_table.shape[0] == num_pts:
+                self._deformation_table = loaded_table
+            else:
+                print(f"WARNING: deformation_table size mismatch (loaded {loaded_table.shape[0]} vs current {num_pts} points). Reinitializing.")
         if os.path.exists(os.path.join(path, "deformation_accum.pth")):
-            self._deformation_accum = torch.load(os.path.join(path, "deformation_accum.pth"),map_location="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            loaded_accum = torch.load(os.path.join(path, "deformation_accum.pth"),map_location="cuda")
+            if loaded_accum.shape[0] == num_pts:
+                self._deformation_accum = loaded_accum
+            else:
+                print(f"WARNING: deformation_accum size mismatch (loaded {loaded_accum.shape[0]} vs current {num_pts} points). Reinitializing.")
+        self.max_radii2D = torch.zeros((num_pts,), device="cuda")
         # print(self._deformation.deformation_net.grid.)
     def save_deformation(self, path):
         torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))

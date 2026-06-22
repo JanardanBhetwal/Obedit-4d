@@ -40,23 +40,43 @@ echo ""
 # echo "✅ Completed time0 image editing."
 # echo ""
 
-# echo "[3/4] 3D editing"
-# python edit_3d.py \
-#     --configs "./arguments/${DATASET}/${SCENE_NAME}.py" \
-#     --ply_path "./output/${DATASET}/${SCENE_NAME}/point_cloud/iteration_14000/point_cloud.ply" \
-#     -s "./data/${DATASET}/${SCENE_NAME}" \
-#     --model_path "./output/${DATASET}/${SCENE_NAME}" \
-#     --dataset "${DATASET}" \
-#     --scene "${SCENE_NAME}" \
-#     --prompt "${PROMPT}" 
+echo "[3/4] 3D editing"
 
-# echo "✅ Completed 3d editing."
-# echo ""
+# Dynamically find the highest iteration in point_cloud/
+POINT_CLOUD_DIR="./output/${DATASET}/${SCENE_NAME}/point_cloud"
+BEST_ITER_3D=$(ls -d "${POINT_CLOUD_DIR}"/iteration_* 2>/dev/null | sed 's/.*iteration_//' | sort -n | tail -1)
+if [ -z "$BEST_ITER_3D" ]; then
+    echo "❌ No iteration folders found in ${POINT_CLOUD_DIR}. Exiting."
+    exit 1
+fi
+echo "   → Selected highest iteration: ${BEST_ITER_3D} from ${POINT_CLOUD_DIR}"
+
+python edit_3d.py \
+    --configs "./arguments/${DATASET}/${SCENE_NAME}.py" \
+    --ply_path "${POINT_CLOUD_DIR}/iteration_${BEST_ITER_3D}/point_cloud.ply" \
+    -s "./data/${DATASET}/${SCENE_NAME}" \
+    --model_path "./output/${DATASET}/${SCENE_NAME}" \
+    --dataset "${DATASET}" \
+    --scene "${SCENE_NAME}" \
+    --prompt "${PROMPT}" 
+
+echo "✅ Completed 3d editing."
+echo ""
 
 echo "[4/4] Score refinement"
+
+# Dynamically find the highest iteration in point_cloud_3dedit/<prompt>/
+POINT_CLOUD_3DEDIT_DIR="./output/${DATASET}/${SCENE_NAME}/point_cloud_3dedit/${PROMPT}"
+BEST_ITER_SDS=$(ls -d "${POINT_CLOUD_3DEDIT_DIR}"/iteration_* 2>/dev/null | sed 's/.*iteration_//' | sort -n | tail -1)
+if [ -z "$BEST_ITER_SDS" ]; then
+    echo "❌ No iteration folders found in ${POINT_CLOUD_3DEDIT_DIR}. Exiting."
+    exit 1
+fi
+echo "   → Selected highest iteration: ${BEST_ITER_SDS} from ${POINT_CLOUD_3DEDIT_DIR}"
+
 python refine_sds.py \
     --configs "./arguments/${DATASET}/${SCENE_NAME}.py" \
-    --ply_path "./output/${DATASET}/${SCENE_NAME}/point_cloud_3dedit/${PROMPT}/iteration_1000/point_cloud.ply" \
+    --ply_path "${POINT_CLOUD_3DEDIT_DIR}/iteration_${BEST_ITER_SDS}/point_cloud.ply" \
     -s "./data/${DATASET}/${SCENE_NAME}" \
     --model_path "./output/${DATASET}/${SCENE_NAME}" \
     --prompt "${PROMPT}" \
