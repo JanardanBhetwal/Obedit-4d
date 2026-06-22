@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # ===================================================================
 # ./run_instruct_4dgs.sh [dataset] [scene_name] [prompt] [guidance_scale] [image_guidance_scale]
 # ===================================================================
@@ -16,18 +15,16 @@ GUIDANCE_SCALE="$4"
 IMAGE_GUIDANCE_SCALE="$5"
 
 echo "------------------------------------------"
-echo "  - dataset: ${DATASET}"  
+echo "  - dataset: ${DATASET}"
 echo "  - scene: ${SCENE_NAME}"
 echo "  - prompt: \"${PROMPT}\""
 echo "------------------------------------------"
 echo ""
 
-# echo "[1/4] Collect time0 images..."
+# echo "[1/5] Collect time0 images..."
 # python time0_collect.py --dataset ${DATASET} --scene_name ${SCENE_NAME}
-
 # echo ""
-
-# echo "[2/4] edit time0 images..."
+# echo "[2/5] edit time0 images..."
 # python ./ip2p_models/multiview_edit.py \
 #     --dataset "${DATASET}" \
 #     --scene "${SCENE_NAME}" \
@@ -36,12 +33,24 @@ echo ""
 #     --steps 20 \
 #     --guidance_scale ${GUIDANCE_SCALE} \
 #     --image_guidance_scale ${IMAGE_GUIDANCE_SCALE}
-
 # echo "✅ Completed time0 image editing."
 # echo ""
 
-echo "[3/4] 3D editing"
+echo "[3/5] Mask + composite edited images against originals..."
+python mask_image_swap.py \
+    --dataset "${DATASET}" \
+    --scene_name "${SCENE_NAME}" \
+    --prompt "${PROMPT}" \
+    --guidance_scale "${GUIDANCE_SCALE}" \
+    --image_guidance_scale "${IMAGE_GUIDANCE_SCALE}"
+if [ $? -ne 0 ]; then
+    echo "❌ Masking step failed. Exiting."
+    exit 1
+fi
+echo "✅ Completed masking and compositing."
+echo ""
 
+echo "[4/5] 3D editing"
 # Dynamically find the highest iteration in point_cloud/
 POINT_CLOUD_DIR="./output/${DATASET}/${SCENE_NAME}/point_cloud"
 BEST_ITER_3D=$(ls -d "${POINT_CLOUD_DIR}"/iteration_* 2>/dev/null | sed 's/.*iteration_//' | sort -n | tail -1)
@@ -50,7 +59,6 @@ if [ -z "$BEST_ITER_3D" ]; then
     exit 1
 fi
 echo "   → Selected highest iteration: ${BEST_ITER_3D} from ${POINT_CLOUD_DIR}"
-
 python edit_3d.py \
     --configs "./arguments/${DATASET}/${SCENE_NAME}.py" \
     --ply_path "${POINT_CLOUD_DIR}/iteration_${BEST_ITER_3D}/point_cloud.ply" \
@@ -58,13 +66,11 @@ python edit_3d.py \
     --model_path "./output/${DATASET}/${SCENE_NAME}" \
     --dataset "${DATASET}" \
     --scene "${SCENE_NAME}" \
-    --prompt "${PROMPT}" 
-
+    --prompt "${PROMPT}"
 echo "✅ Completed 3d editing."
 echo ""
 
-echo "[4/4] Score refinement"
-
+echo "[5/5] Score refinement"
 # Dynamically find the highest iteration in point_cloud_3dedit/<prompt>/
 POINT_CLOUD_3DEDIT_DIR="./output/${DATASET}/${SCENE_NAME}/point_cloud_3dedit/${PROMPT}"
 BEST_ITER_SDS=$(ls -d "${POINT_CLOUD_3DEDIT_DIR}"/iteration_* 2>/dev/null | sed 's/.*iteration_//' | sort -n | tail -1)
@@ -73,7 +79,6 @@ if [ -z "$BEST_ITER_SDS" ]; then
     exit 1
 fi
 echo "   → Selected highest iteration: ${BEST_ITER_SDS} from ${POINT_CLOUD_3DEDIT_DIR}"
-
 python refine_sds.py \
     --configs "./arguments/${DATASET}/${SCENE_NAME}.py" \
     --ply_path "${POINT_CLOUD_3DEDIT_DIR}/iteration_${BEST_ITER_SDS}/point_cloud.ply" \
@@ -82,7 +87,6 @@ python refine_sds.py \
     --prompt "${PROMPT}" \
     --guidance_scale ${GUIDANCE_SCALE} \
     --image_guidance_scale ${IMAGE_GUIDANCE_SCALE}
-
 echo "✅ Completed score refinement."
 echo ""
 
