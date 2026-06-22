@@ -21,20 +21,20 @@ echo "  - prompt: \"${PROMPT}\""
 echo "------------------------------------------"
 echo ""
 
-# echo "[1/5] Collect time0 images..."
-# python time0_collect.py --dataset ${DATASET} --scene_name ${SCENE_NAME}
-# echo ""
-# echo "[2/5] edit time0 images..."
-# python ./ip2p_models/multiview_edit.py \
-#     --dataset "${DATASET}" \
-#     --scene "${SCENE_NAME}" \
-#     --prompt "${PROMPT}" \
-#     --resize 1024 \
-#     --steps 20 \
-#     --guidance_scale ${GUIDANCE_SCALE} \
-#     --image_guidance_scale ${IMAGE_GUIDANCE_SCALE}
-# echo "✅ Completed time0 image editing."
-# echo ""
+echo "[1/5] Collect time0 images..."
+python time0_collect.py --dataset ${DATASET} --scene_name ${SCENE_NAME}
+echo ""
+echo "[2/5] edit time0 images..."
+python ./ip2p_models/multiview_edit.py \
+    --dataset "${DATASET}" \
+    --scene "${SCENE_NAME}" \
+    --prompt "${PROMPT}" \
+    --resize 1024 \
+    --steps 20 \
+    --guidance_scale ${GUIDANCE_SCALE} \
+    --image_guidance_scale ${IMAGE_GUIDANCE_SCALE}
+echo "✅ Completed time0 image editing."
+echo ""
 
 echo "[3/5] Mask + composite edited images against originals..."
 python mask_image_swap.py \
